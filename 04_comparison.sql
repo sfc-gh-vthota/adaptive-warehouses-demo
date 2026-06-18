@@ -176,9 +176,7 @@ ORDER BY a.QUERY_NUM;
 -- =============================================================================
 -- STEP 4: COST SUMMARY - Single view combining both approaches
 -- Fixed WH: uptime-based (query window + 8 min auto-suspend) * 8 credits/hr
--- Adaptive WH: sum of per-query credits from QUERY_ATTRIBUTION_HISTORY
--- NOTE: QUERY_ATTRIBUTION_HISTORY has ~24 hr latency for new data.
---       Run this step the next day after the demo for accurate adaptive costs.
+-- Adaptive WH: sum of per-query credits from QUERY_METERING_HISTORY
 -- =============================================================================
 
 WITH fixed_cost AS (
@@ -186,11 +184,11 @@ WITH fixed_cost AS (
         ROUND((DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480) / 3600.0 * 8, 4) AS CREDITS
 ),
 adaptive_cost AS (
-    SELECT COALESCE(SUM(CREDITS_ATTRIBUTED_COMPUTE), 0) AS CREDITS
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+    SELECT COALESCE(SUM(CREDITS_USED), 0) AS CREDITS
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_METERING_HISTORY
     WHERE WAREHOUSE_NAME = 'JPMC_MERCHANT_ADAPTIVE_WH'
       AND QUERY_TAG = 'ADAPTIVE_WH_DEMO'
-      AND START_TIME BETWEEN $ADAPTIVE_START AND $ADAPTIVE_END
+      AND QUERY_START_TIME BETWEEN $ADAPTIVE_START AND $ADAPTIVE_END
 )
 SELECT
     'Fixed Large WH' AS APPROACH,
@@ -205,7 +203,7 @@ SELECT
     'Adaptive WH' AS APPROACH,
     DATEDIFF('SECOND', $ADAPTIVE_START, $ADAPTIVE_END) AS UPTIME_SEC,
     a.CREDITS AS TOTAL_CREDITS,
-    'Per-query billing: sum of CREDITS_ATTRIBUTED_COMPUTE per query' AS BILLING_MODEL
+    'Per-query billing: sum of actual credits consumed by each query' AS BILLING_MODEL
 FROM adaptive_cost a;
 
 
