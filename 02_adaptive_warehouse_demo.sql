@@ -40,6 +40,16 @@ USE WAREHOUSE JPMC_MERCHANT_ADAPTIVE_WH;
 -- Tag all queries from this point for filtering in query history
 ALTER SESSION SET QUERY_TAG = 'ADAPTIVE_WH_DEMO';
 
+-- Create run log table (if not exists) and record start timestamp
+CREATE TABLE IF NOT EXISTS DEMO_RUN_LOG (
+    RUN_ID VARCHAR,
+    WAREHOUSE_TYPE VARCHAR,
+    START_TS TIMESTAMP_LTZ,
+    END_TS TIMESTAMP_LTZ
+);
+INSERT INTO DEMO_RUN_LOG (RUN_ID, WAREHOUSE_TYPE, START_TS)
+    VALUES ('ADAPTIVE_WH_DEMO', 'ADAPTIVE', CURRENT_TIMESTAMP());
+
 -- =============================================================================
 -- QUERY 1: SIMPLE POINT LOOKUP (Adaptive uses minimal resources)
 -- Equivalent to XS warehouse — team was running this on XL!
@@ -334,5 +344,11 @@ LEFT JOIN quarterly_chargebacks qc
     AND qc.MERCHANT_CATEGORY = qm.MERCHANT_CATEGORY
     AND qc.STATE = qm.STATE
 ORDER BY qm.QUARTER DESC, qm.TOTAL_VOLUME DESC;
+
+-- Record end timestamp
+ALTER SESSION SET QUERY_TAG = '';
+UPDATE DEMO_RUN_LOG SET END_TS = CURRENT_TIMESTAMP()
+    WHERE RUN_ID = 'ADAPTIVE_WH_DEMO'
+    AND END_TS IS NULL;
 
 -- End of test queries. Run 04_comparison.sql to analyze results.

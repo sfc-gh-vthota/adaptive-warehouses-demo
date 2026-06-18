@@ -32,6 +32,10 @@ ALTER SESSION SET USE_CACHED_RESULT = FALSE;
 -- Tag all queries in this session for easy filtering in query history
 ALTER SESSION SET QUERY_TAG = 'FIXED_L_WH_DEMO';
 
+-- Record start timestamp
+INSERT INTO DEMO_RUN_LOG (RUN_ID, WAREHOUSE_TYPE, START_TS)
+    VALUES ('FIXED_L_WH_DEMO', 'FIXED_LARGE', CURRENT_TIMESTAMP());
+
 -- =============================================================================
 -- QUERY 1: SIMPLE POINT LOOKUP
 -- On Large WH: OVER-PROVISIONED — paying 8 credits/hr for a sub-second query
@@ -282,5 +286,11 @@ LEFT JOIN quarterly_chargebacks qc
     AND qc.MERCHANT_CATEGORY = qm.MERCHANT_CATEGORY
     AND qc.STATE = qm.STATE
 ORDER BY qm.QUARTER DESC, qm.TOTAL_VOLUME DESC;
+
+-- Record end timestamp
+ALTER SESSION SET QUERY_TAG = '';
+UPDATE DEMO_RUN_LOG SET END_TS = CURRENT_TIMESTAMP()
+    WHERE RUN_ID = 'FIXED_L_WH_DEMO'
+    AND END_TS IS NULL;
 
 -- End of test queries. Run 04_comparison.sql to analyze results.
