@@ -174,7 +174,33 @@ ORDER BY a.QUERY_NUM;
 
 
 -- =============================================================================
--- STEP 4: COST SUMMARY - Single view combining both approaches
+-- STEP 4: PER-QUERY CREDITS - Adaptive warehouse query-level cost breakdown
+-- =============================================================================
+
+WITH adaptive_queries AS (
+    SELECT QUERY_ID, LEFT(QUERY_TEXT, 50) AS QUERY_PREVIEW, START_TIME
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_WAREHOUSE(
+        WAREHOUSE_NAME => 'JPMC_MERCHANT_ADAPTIVE_WH',
+        RESULT_LIMIT => 20,
+        END_TIME_RANGE_START => $ADAPTIVE_START
+    ))
+    WHERE QUERY_TAG = 'ADAPTIVE_WH_DEMO'
+      AND QUERY_TYPE = 'SELECT'
+      AND START_TIME BETWEEN $ADAPTIVE_START AND $ADAPTIVE_END
+)
+SELECT
+    ROW_NUMBER() OVER (ORDER BY q.START_TIME) AS QUERY_NUM,
+    q.QUERY_PREVIEW,
+    m.CREDITS_USED_COMPUTE,
+    m.CREDITS_USED_CLOUD_SERVICES,
+    m.CREDITS_USED AS TOTAL_CREDITS
+FROM adaptive_queries q
+INNER JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_METERING_HISTORY m ON m.QUERY_ID = q.QUERY_ID
+ORDER BY q.START_TIME;
+
+
+-- =============================================================================
+-- STEP 5: COST SUMMARY - Single view combining both approaches
 -- Fixed WH: uptime-based (query window + 8 min auto-suspend) * 8 credits/hr
 -- Adaptive WH: sum of per-query credits from QUERY_METERING_HISTORY
 --              joined by QUERY_ID from real-time query history
@@ -185,7 +211,6 @@ WITH fixed_cost AS (
         ROUND((DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480) / 3600.0 * 8, 4) AS CREDITS
 ),
 adaptive_query_ids AS (
-    -- Get exact query IDs from real-time query history (no latency)
     SELECT QUERY_ID
     FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_WAREHOUSE(
         WAREHOUSE_NAME => 'JPMC_MERCHANT_ADAPTIVE_WH',
@@ -197,30 +222,29 @@ adaptive_query_ids AS (
       AND START_TIME BETWEEN $ADAPTIVE_START AND $ADAPTIVE_END
 ),
 adaptive_cost AS (
-    -- Sum per-query credits only for those exact query IDs
     SELECT COALESCE(SUM(m.CREDITS_USED), 0) AS CREDITS
     FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_METERING_HISTORY m
     INNER JOIN adaptive_query_ids q ON q.QUERY_ID = m.QUERY_ID
 )
 SELECT
-    'Fixed Large WH' AS APPROACH,
-    DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480 AS UPTIME_SEC,
-    f.CREDITS AS TOTAL_CREDITS,
-    '8 credits/hr for entire uptime regardless of query complexity' AS BILLING_MODEL
-FROM fixed_cost f
-
-UNION ALL
-
-SELECT
     'Adaptive WH' AS APPROACH,
     DATEDIFF('SECOND', $ADAPTIVE_START, $ADAPTIVE_END) AS UPTIME_SEC,
     a.CREDITS AS TOTAL_CREDITS,
     'Per-query billing: sum of actual credits consumed by each query' AS BILLING_MODEL
-FROM adaptive_cost a;
+FROM adaptive_cost a
+
+UNION ALL
+
+SELECT
+    'Fixed Large WH' AS APPROACH,
+    DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480 AS UPTIME_SEC,
+    f.CREDITS AS TOTAL_CREDITS,
+    '8 credits/hr for entire uptime regardless of query complexity' AS BILLING_MODEL
+FROM fixed_cost f;
 
 
 -- =============================================================================
--- STEP 5: EXECUTIVE SUMMARY
+-- STEP 6: EXECUTIVE SUMMARY
 -- =============================================================================
 
 /*
