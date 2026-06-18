@@ -174,55 +174,9 @@ ORDER BY a.QUERY_NUM;
 
 
 -- =============================================================================
--- STEP 4: COST COMPARISON
--- Fixed WH cost = total uptime * credit rate
--- Uptime = (last query end - first query start) + auto_suspend (8 minutes)
--- Large WH = 8 credits/hour
--- =============================================================================
-
-SELECT
-    -- Fixed Large Warehouse: cost based on UPTIME (not query runtime)
-    'JPMC_MERCHANT_L_WH' AS WAREHOUSE_NAME,
-    'FIXED_LARGE' AS WAREHOUSE_TYPE,
-    DATEDIFF('SECOND', $FIXED_START, $FIXED_END) AS QUERY_WINDOW_SEC,
-    480 AS AUTO_SUSPEND_SEC,
-    DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480 AS TOTAL_UPTIME_SEC,
-    8 AS CREDITS_PER_HOUR,
-    ROUND((DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480) / 3600.0 * 8, 4) AS ESTIMATED_CREDITS
-
-UNION ALL
-
-SELECT
-    -- Adaptive Warehouse: cost from metering history (per-query billing)
-    'JPMC_MERCHANT_ADAPTIVE_WH' AS WAREHOUSE_NAME,
-    'ADAPTIVE' AS WAREHOUSE_TYPE,
-    DATEDIFF('SECOND', $ADAPTIVE_START, $ADAPTIVE_END) AS QUERY_WINDOW_SEC,
-    0 AS AUTO_SUSPEND_SEC,
-    DATEDIFF('SECOND', $ADAPTIVE_START, $ADAPTIVE_END) AS TOTAL_UPTIME_SEC,
-    NULL AS CREDITS_PER_HOUR,
-    NULL AS ESTIMATED_CREDITS  -- Actual credits from metering below
-;
-
--- Actual credits from WAREHOUSE_METERING_HISTORY
--- NOTE: Adaptive warehouse credits only appear in ACCOUNT_USAGE (has ~2-3 hr latency)
--- Fixed warehouse credits appear in both INFORMATION_SCHEMA and ACCOUNT_USAGE
--- For live demo: show the fixed WH cost calculation (Step 4 above) immediately,
--- then run this query later to confirm adaptive credits.
-SELECT
-    WAREHOUSE_NAME,
-    SUM(CREDITS_USED_COMPUTE) AS COMPUTE_CREDITS,
-    SUM(CREDITS_USED_CLOUD_SERVICES) AS CLOUD_SERVICES_CREDITS,
-    SUM(CREDITS_USED) AS TOTAL_CREDITS
-FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-WHERE WAREHOUSE_NAME IN ('JPMC_MERCHANT_ADAPTIVE_WH', 'JPMC_MERCHANT_L_WH')
-  AND START_TIME >= DATE_TRUNC('HOUR', $ADAPTIVE_START)
-  AND END_TIME <= DATEADD(HOUR, 1, $FIXED_END)
-GROUP BY WAREHOUSE_NAME
-ORDER BY WAREHOUSE_NAME;
-
-
--- =============================================================================
--- STEP 5: COST SUMMARY - Single view combining both approaches
+-- STEP 4: COST SUMMARY - Single view combining both approaches
+-- Fixed WH: uptime-based (query window + 8 min auto-suspend) * 8 credits/hr
+-- Adaptive WH: actual credits from ACCOUNT_USAGE (has ~2-3 hr latency)
 -- =============================================================================
 
 WITH fixed_cost AS (
@@ -254,7 +208,7 @@ FROM adaptive_cost a;
 
 
 -- =============================================================================
--- STEP 6: EXECUTIVE SUMMARY
+-- STEP 5: EXECUTIVE SUMMARY
 -- =============================================================================
 
 /*
