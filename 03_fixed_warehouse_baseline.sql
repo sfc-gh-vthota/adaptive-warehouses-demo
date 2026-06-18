@@ -26,6 +26,9 @@ USE DATABASE JPMC_MERCHANT_SERVICES_DEMO;
 USE SCHEMA MERCHANT_DATA;
 USE WAREHOUSE JPMC_MERCHANT_L_WH;
 
+-- Disable result cache so every query hits compute (important for fair comparison)
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+
 -- =============================================================================
 -- QUERY 1: SIMPLE POINT LOOKUP
 -- On Large WH: OVER-PROVISIONED — paying 8 credits/hr for a sub-second query
