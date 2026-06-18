@@ -29,6 +29,9 @@ USE WAREHOUSE JPMC_MERCHANT_L_WH;
 -- Disable result cache so every query hits compute (important for fair comparison)
 ALTER SESSION SET USE_CACHED_RESULT = FALSE;
 
+-- Tag all queries in this session for easy filtering in query history
+ALTER SESSION SET QUERY_TAG = 'FIXED_L_WH_DEMO';
+
 -- =============================================================================
 -- QUERY 1: SIMPLE POINT LOOKUP
 -- On Large WH: OVER-PROVISIONED — paying 8 credits/hr for a sub-second query
@@ -282,15 +285,12 @@ ORDER BY qm.QUARTER DESC, qm.TOTAL_VOLUME DESC;
 
 
 -- =============================================================================
--- COMPARE RESULTS: Query history for this warehouse
+-- COMPARE RESULTS: Query history for this warehouse (using query tag)
 -- =============================================================================
-
-/*
-  After running all 8 queries above, run this to see execution times:
-*/
 
 SELECT
     QUERY_ID,
+    QUERY_TAG,
     LEFT(QUERY_TEXT, 60) AS QUERY_PREVIEW,
     WAREHOUSE_NAME,
     WAREHOUSE_SIZE,
@@ -300,38 +300,147 @@ SELECT
     EXECUTION_TIME / 1000 AS EXEC_SECONDS
 FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
     RESULT_LIMIT => 20,
-    END_TIME_RANGE_START => DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
+    END_TIME_RANGE_START => DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
 ))
-WHERE WAREHOUSE_NAME = 'JPMC_MERCHANT_L_WH'
+WHERE QUERY_TAG = 'FIXED_L_WH_DEMO'
   AND QUERY_TYPE = 'SELECT'
+  AND QUERY_TEXT NOT LIKE '%QUERY_HISTORY%'
+  AND QUERY_TEXT NOT LIKE '%QUERY_TAG%'
 ORDER BY START_TIME DESC;
 
 
 -- =============================================================================
--- SIDE-BY-SIDE COMPARISON (run after both scripts complete)
+-- SIDE-BY-SIDE PERFORMANCE COMPARISON (run after both scripts complete)
+-- Uses QUERY_TAG to reliably identify queries from each demo run
 -- =============================================================================
 
-/*
-  Run this query to compare adaptive vs fixed Large warehouse performance:
-*/
-
 SELECT
+    QUERY_TAG,
     WAREHOUSE_NAME,
     WAREHOUSE_SIZE,
     COUNT(*) AS QUERIES_RUN,
     ROUND(AVG(TOTAL_ELAPSED_TIME) / 1000, 2) AS AVG_ELAPSED_SEC,
     ROUND(MAX(TOTAL_ELAPSED_TIME) / 1000, 2) AS MAX_ELAPSED_SEC,
     ROUND(MIN(TOTAL_ELAPSED_TIME) / 1000, 2) AS MIN_ELAPSED_SEC,
+    ROUND(SUM(TOTAL_ELAPSED_TIME) / 1000, 2) AS TOTAL_ELAPSED_SEC,
     ROUND(SUM(BYTES_SCANNED) / (1024*1024*1024), 2) AS TOTAL_GB_SCANNED
 FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
     RESULT_LIMIT => 50,
     END_TIME_RANGE_START => DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
 ))
-WHERE WAREHOUSE_NAME IN ('JPMC_MERCHANT_ADAPTIVE_WH', 'JPMC_MERCHANT_L_WH')
+WHERE QUERY_TAG IN ('ADAPTIVE_WH_DEMO', 'FIXED_L_WH_DEMO')
   AND QUERY_TYPE = 'SELECT'
-  AND QUERY_TEXT NOT LIKE '%INFORMATION_SCHEMA%'
-GROUP BY 1, 2
+  AND QUERY_TEXT NOT LIKE '%QUERY_HISTORY%'
+  AND QUERY_TEXT NOT LIKE '%QUERY_TAG%'
+GROUP BY 1, 2, 3
+ORDER BY QUERY_TAG;
+
+
+-- =============================================================================
+-- COST COMPARISON (run after both scripts complete)
+-- Uses WAREHOUSE_METERING_HISTORY to show actual credits consumed
+-- NOTE: Metering data may take 1-2 minutes to appear after queries complete
+-- =============================================================================
+
+-- Option A: Credits from WAREHOUSE_METERING_HISTORY (near real-time, 1-2 min lag)
+SELECT
+    WAREHOUSE_NAME,
+    SUM(CREDITS_USED_COMPUTE) AS COMPUTE_CREDITS,
+    SUM(CREDITS_USED_CLOUD_SERVICES) AS CLOUD_SERVICES_CREDITS,
+    SUM(CREDITS_USED) AS TOTAL_CREDITS
+FROM TABLE(INFORMATION_SCHEMA.WAREHOUSE_METERING_HISTORY(
+    DATE_RANGE_START => DATEADD(HOUR, -2, CURRENT_TIMESTAMP()),
+    DATE_RANGE_END => CURRENT_TIMESTAMP()
+))
+WHERE WAREHOUSE_NAME IN ('JPMC_MERCHANT_ADAPTIVE_WH', 'JPMC_MERCHANT_L_WH')
+GROUP BY WAREHOUSE_NAME
 ORDER BY WAREHOUSE_NAME;
+
+
+-- Option B: Estimated cost per query using execution time and warehouse credit rates
+-- Large = 8 credits/hr, Adaptive = per-query billing (shown in metering history)
+SELECT
+    QUERY_TAG,
+    WAREHOUSE_NAME,
+    COUNT(*) AS QUERIES,
+    ROUND(SUM(TOTAL_ELAPSED_TIME) / 1000, 2) AS TOTAL_RUNTIME_SEC,
+    ROUND(SUM(EXECUTION_TIME) / 1000, 2) AS TOTAL_EXEC_SEC,
+    -- For FIXED Large WH: 8 credits/hr prorated by execution time
+    CASE
+        WHEN WAREHOUSE_NAME = 'JPMC_MERCHANT_L_WH'
+        THEN ROUND(SUM(EXECUTION_TIME) / 1000.0 / 3600.0 * 8, 4)
+        ELSE NULL
+    END AS ESTIMATED_CREDITS_FIXED_L,
+    -- For Adaptive: check WAREHOUSE_METERING_HISTORY (cannot estimate per-query here)
+    CASE
+        WHEN WAREHOUSE_NAME = 'JPMC_MERCHANT_ADAPTIVE_WH'
+        THEN 'Check WAREHOUSE_METERING_HISTORY above'
+        ELSE NULL
+    END AS ADAPTIVE_COST_NOTE
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+    RESULT_LIMIT => 50,
+    END_TIME_RANGE_START => DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
+))
+WHERE QUERY_TAG IN ('ADAPTIVE_WH_DEMO', 'FIXED_L_WH_DEMO')
+  AND QUERY_TYPE = 'SELECT'
+  AND QUERY_TEXT NOT LIKE '%QUERY_HISTORY%'
+  AND QUERY_TEXT NOT LIKE '%QUERY_TAG%'
+GROUP BY 1, 2
+ORDER BY QUERY_TAG;
+
+
+-- =============================================================================
+-- DETAILED PER-QUERY COMPARISON (side by side, matched by query order)
+-- =============================================================================
+
+WITH adaptive_queries AS (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY START_TIME) AS QUERY_NUM,
+        LEFT(QUERY_TEXT, 50) AS QUERY_PREVIEW,
+        TOTAL_ELAPSED_TIME / 1000 AS ELAPSED_SEC,
+        EXECUTION_TIME / 1000 AS EXEC_SEC,
+        BYTES_SCANNED / (1024*1024*1024) AS GB_SCANNED
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+        RESULT_LIMIT => 20,
+        END_TIME_RANGE_START => DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
+    ))
+    WHERE QUERY_TAG = 'ADAPTIVE_WH_DEMO'
+      AND QUERY_TYPE = 'SELECT'
+      AND QUERY_TEXT NOT LIKE '%QUERY_HISTORY%'
+      AND QUERY_TEXT NOT LIKE '%QUERY_TAG%'
+),
+fixed_queries AS (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY START_TIME) AS QUERY_NUM,
+        LEFT(QUERY_TEXT, 50) AS QUERY_PREVIEW,
+        TOTAL_ELAPSED_TIME / 1000 AS ELAPSED_SEC,
+        EXECUTION_TIME / 1000 AS EXEC_SEC,
+        BYTES_SCANNED / (1024*1024*1024) AS GB_SCANNED
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+        RESULT_LIMIT => 20,
+        END_TIME_RANGE_START => DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
+    ))
+    WHERE QUERY_TAG = 'FIXED_L_WH_DEMO'
+      AND QUERY_TYPE = 'SELECT'
+      AND QUERY_TEXT NOT LIKE '%QUERY_HISTORY%'
+      AND QUERY_TEXT NOT LIKE '%QUERY_TAG%'
+)
+SELECT
+    a.QUERY_NUM,
+    a.QUERY_PREVIEW,
+    a.ELAPSED_SEC AS ADAPTIVE_ELAPSED_SEC,
+    f.ELAPSED_SEC AS FIXED_L_ELAPSED_SEC,
+    ROUND(f.ELAPSED_SEC - a.ELAPSED_SEC, 2) AS DIFF_SEC,
+    CASE
+        WHEN f.ELAPSED_SEC > 0
+        THEN ROUND((f.ELAPSED_SEC - a.ELAPSED_SEC) / f.ELAPSED_SEC * 100, 1)
+        ELSE 0
+    END AS ADAPTIVE_PCT_FASTER,
+    a.GB_SCANNED
+FROM adaptive_queries a
+JOIN fixed_queries f ON f.QUERY_NUM = a.QUERY_NUM
+ORDER BY a.QUERY_NUM;
+
 
 /*
   ================================================================================
@@ -348,6 +457,12 @@ ORDER BY WAREHOUSE_NAME;
   - Simple queries: Uses minimal resources → less cost per query
   - Complex queries: Scales up automatically → faster execution
   - Net result: Better performance at similar or lower total cost
+
+  COST INSIGHT:
+  - Fixed L WH: Credits = (total execution seconds / 3600) × 8 credits/hr
+    Even for a 0.2 second point lookup, minimum 60 sec billing applies
+  - Adaptive WH: Credits from metering history reflect actual per-query usage
+    Simple queries consume far fewer credits than the L rate
 
   KEY TALKING POINT:
   "With a fixed Large warehouse, you're either over-paying for simple work
