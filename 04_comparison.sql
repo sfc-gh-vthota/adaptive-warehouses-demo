@@ -177,18 +177,30 @@ ORDER BY a.QUERY_NUM;
 -- STEP 4: COST SUMMARY - Single view combining both approaches
 -- Fixed WH: uptime-based (query window + 8 min auto-suspend) * 8 credits/hr
 -- Adaptive WH: sum of per-query credits from QUERY_METERING_HISTORY
+--              joined by QUERY_ID from real-time query history
 -- =============================================================================
 
 WITH fixed_cost AS (
     SELECT
         ROUND((DATEDIFF('SECOND', $FIXED_START, $FIXED_END) + 480) / 3600.0 * 8, 4) AS CREDITS
 ),
+adaptive_query_ids AS (
+    -- Get exact query IDs from real-time query history (no latency)
+    SELECT QUERY_ID
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_WAREHOUSE(
+        WAREHOUSE_NAME => 'JPMC_MERCHANT_ADAPTIVE_WH',
+        RESULT_LIMIT => 20,
+        END_TIME_RANGE_START => $ADAPTIVE_START
+    ))
+    WHERE QUERY_TAG = 'ADAPTIVE_WH_DEMO'
+      AND QUERY_TYPE = 'SELECT'
+      AND START_TIME BETWEEN $ADAPTIVE_START AND $ADAPTIVE_END
+),
 adaptive_cost AS (
-    SELECT COALESCE(SUM(CREDITS_USED), 0) AS CREDITS
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_METERING_HISTORY
-    WHERE WAREHOUSE_NAME = 'JPMC_MERCHANT_ADAPTIVE_WH'
-      AND QUERY_TAG = 'ADAPTIVE_WH_DEMO'
-      AND QUERY_START_TIME BETWEEN $ADAPTIVE_START AND $ADAPTIVE_END
+    -- Sum per-query credits only for those exact query IDs
+    SELECT COALESCE(SUM(m.CREDITS_USED), 0) AS CREDITS
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_METERING_HISTORY m
+    INNER JOIN adaptive_query_ids q ON q.QUERY_ID = m.QUERY_ID
 )
 SELECT
     'Fixed Large WH' AS APPROACH,
