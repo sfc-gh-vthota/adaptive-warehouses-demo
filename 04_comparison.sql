@@ -8,37 +8,41 @@
   INSTRUCTIONS:
   1. Run 02_adaptive_warehouse_demo.sql first (tags queries as ADAPTIVE_WH_DEMO)
   2. Run 03_fixed_warehouse_baseline.sql second (tags queries as FIXED_L_WH_DEMO)
-  3. Wait 2 minutes for metering data to populate
-  4. Run this script to see the comparison
+  3. Run this script immediately to see the comparison (no wait needed)
 
+  Uses INFORMATION_SCHEMA table functions for real-time results (no latency).
   Both scripts set QUERY_TAG at the session level, so only the 8 test queries
   in each script are tagged. This script uses those tags to filter precisely.
   ================================================================================
 */
 
-USE ROLE ACCOUNTADMIN;
+USE ROLE SYSADMIN;
 USE DATABASE JPMC_MERCHANT_SERVICES_DEMO;
 USE SCHEMA MERCHANT_DATA;
 
 -- =============================================================================
 -- STEP 1: Capture the start time of the earliest tagged query
--- This anchors all subsequent comparison queries to the actual test window
+-- Uses INFORMATION_SCHEMA (real-time, no latency) to anchor the comparison window
 -- =============================================================================
 
 SET ADAPTIVE_START_TIME = (
     SELECT MIN(START_TIME)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+        RESULT_LIMIT => 50,
+        END_TIME_RANGE_START => DATEADD(HOUR, -4, CURRENT_TIMESTAMP())
+    ))
     WHERE QUERY_TAG = 'ADAPTIVE_WH_DEMO'
       AND QUERY_TYPE = 'SELECT'
-      AND START_TIME >= DATEADD(HOUR, -4, CURRENT_TIMESTAMP())
 );
 
 SET FIXED_START_TIME = (
     SELECT MIN(START_TIME)
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+        RESULT_LIMIT => 50,
+        END_TIME_RANGE_START => DATEADD(HOUR, -4, CURRENT_TIMESTAMP())
+    ))
     WHERE QUERY_TAG = 'FIXED_L_WH_DEMO'
       AND QUERY_TYPE = 'SELECT'
-      AND START_TIME >= DATEADD(HOUR, -4, CURRENT_TIMESTAMP())
 );
 
 SET TEST_WINDOW_START = (
@@ -67,10 +71,12 @@ SELECT
     ROUND(MIN(TOTAL_ELAPSED_TIME) / 1000, 2) AS MIN_ELAPSED_SEC,
     ROUND(SUM(EXECUTION_TIME) / 1000, 2) AS TOTAL_EXEC_SEC,
     ROUND(SUM(BYTES_SCANNED) / (1024*1024*1024), 2) AS TOTAL_GB_SCANNED
-FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+    RESULT_LIMIT => 50,
+    END_TIME_RANGE_START => $TEST_WINDOW_START
+))
 WHERE QUERY_TAG IN ('ADAPTIVE_WH_DEMO', 'FIXED_L_WH_DEMO')
   AND QUERY_TYPE = 'SELECT'
-  AND START_TIME >= $TEST_WINDOW_START
 GROUP BY 1, 2, 3
 ORDER BY QUERY_TAG;
 
@@ -86,10 +92,12 @@ WITH adaptive_queries AS (
         TOTAL_ELAPSED_TIME / 1000 AS ELAPSED_SEC,
         EXECUTION_TIME / 1000 AS EXEC_SEC,
         BYTES_SCANNED / (1024*1024*1024) AS GB_SCANNED
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+        RESULT_LIMIT => 20,
+        END_TIME_RANGE_START => $ADAPTIVE_START_TIME
+    ))
     WHERE QUERY_TAG = 'ADAPTIVE_WH_DEMO'
       AND QUERY_TYPE = 'SELECT'
-      AND START_TIME >= $ADAPTIVE_START_TIME
 ),
 fixed_queries AS (
     SELECT
@@ -98,10 +106,12 @@ fixed_queries AS (
         TOTAL_ELAPSED_TIME / 1000 AS ELAPSED_SEC,
         EXECUTION_TIME / 1000 AS EXEC_SEC,
         BYTES_SCANNED / (1024*1024*1024) AS GB_SCANNED
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+        RESULT_LIMIT => 20,
+        END_TIME_RANGE_START => $FIXED_START_TIME
+    ))
     WHERE QUERY_TAG = 'FIXED_L_WH_DEMO'
       AND QUERY_TYPE = 'SELECT'
-      AND START_TIME >= $FIXED_START_TIME
 )
 SELECT
     a.QUERY_NUM,
@@ -124,8 +134,7 @@ ORDER BY a.QUERY_NUM;
 
 -- =============================================================================
 -- STEP 4: COST COMPARISON - Actual credits consumed
--- Uses WAREHOUSE_METERING_HISTORY with precise timestamp window
--- NOTE: Metering data has ~1-2 minute latency. Wait before running.
+-- Uses INFORMATION_SCHEMA.WAREHOUSE_METERING_HISTORY (real-time)
 -- =============================================================================
 
 SELECT
@@ -133,17 +142,19 @@ SELECT
     SUM(CREDITS_USED_COMPUTE) AS COMPUTE_CREDITS,
     SUM(CREDITS_USED_CLOUD_SERVICES) AS CLOUD_SERVICES_CREDITS,
     SUM(CREDITS_USED) AS TOTAL_CREDITS
-FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+FROM TABLE(INFORMATION_SCHEMA.WAREHOUSE_METERING_HISTORY(
+    DATE_RANGE_START => $TEST_WINDOW_START,
+    DATE_RANGE_END => CURRENT_TIMESTAMP()
+))
 WHERE WAREHOUSE_NAME IN ('JPMC_MERCHANT_ADAPTIVE_WH', 'JPMC_MERCHANT_L_WH')
-  AND START_TIME >= $TEST_WINDOW_START
 GROUP BY WAREHOUSE_NAME
 ORDER BY WAREHOUSE_NAME;
 
 
 -- =============================================================================
--- STEP 5: COST ESTIMATION (immediate, no latency)
--- For Fixed L WH: 8 credits/hr prorated by actual execution time
--- For Adaptive: actual metering (above) is authoritative; this estimates minimum
+-- STEP 5: COST ESTIMATION based on execution time
+-- Fixed L: 8 credits/hr prorated by actual execution time (min 60s billing)
+-- Adaptive: per-query billing shown in metering history above
 -- =============================================================================
 
 SELECT
@@ -153,7 +164,6 @@ SELECT
     ROUND(SUM(EXECUTION_TIME) / 1000, 2) AS TOTAL_EXEC_SEC,
     ROUND(SUM(TOTAL_ELAPSED_TIME) / 1000, 2) AS TOTAL_ELAPSED_SEC,
     -- Fixed L: 8 credits/hr. Minimum billing = 60 sec per warehouse resume.
-    -- Prorated cost = (execution_seconds / 3600) * 8
     CASE
         WHEN WAREHOUSE_NAME = 'JPMC_MERCHANT_L_WH'
         THEN ROUND(GREATEST(SUM(EXECUTION_TIME) / 1000.0, 60) / 3600.0 * 8, 4)
@@ -162,10 +172,12 @@ SELECT
         WHEN WAREHOUSE_NAME = 'JPMC_MERCHANT_ADAPTIVE_WH'
         THEN '(see WAREHOUSE_METERING_HISTORY above for actual)'
     END AS ADAPTIVE_CREDITS_NOTE
-FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+    RESULT_LIMIT => 50,
+    END_TIME_RANGE_START => $TEST_WINDOW_START
+))
 WHERE QUERY_TAG IN ('ADAPTIVE_WH_DEMO', 'FIXED_L_WH_DEMO')
   AND QUERY_TYPE = 'SELECT'
-  AND START_TIME >= $TEST_WINDOW_START
 GROUP BY 1, 2
 ORDER BY QUERY_TAG;
 
